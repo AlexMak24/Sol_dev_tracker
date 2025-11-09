@@ -1,0 +1,11 @@
+{
+  "min_avg_mcap": 0,
+  "min_migration_percent": 20,
+  "min_twitter_followers": 0,
+  "min_admin_followers": 0,
+  "enable_avg_mcap": false,
+  "enable_migrations": true,
+  "enable_twitter_followers": false,
+  "enable_admin_followers": false,
+  "use_and_mode": true
+}
