@@ -1,0 +1,30 @@
+{
+  "min_avg_mcap": 0,
+  "min_avg_ath_mcap": 11000,
+  "min_migration_percent": 27,
+  "min_twitter_followers": 0,
+  "min_community_members": 1,
+  "min_admin_followers": 0,
+  "dev_tokens_count": 10,
+  "enable_avg_mcap": false,
+  "enable_avg_ath_mcap": false,
+  "enable_migrations": false,
+  "enable_twitter_user": false,
+  "enable_twitter_community": false,
+  "enable_protocol_filter": true,
+  "protocols": {
+    "pump v1": false,
+    "meteora amm v2": true,
+    "orca": true,
+    "virtual curve": true,
+    "raydium cpmm": false,
+    "launchlab": false,
+    "meteora dlmm": true,
+    "sugar": false,
+    "pump amm": false,
+    "raydium clmm": false,
+    "moonshot": false,
+    "other": false
+  },
+  "use_and_mode": false
+}

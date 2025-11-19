@@ -1,0 +1,92 @@
+[
+  {
+    "pairAddress": "GzMwBuW7YBXtdW6nTkhQSebnheU9sMkHBDj8RcsV1nwX",
+    "last_transaction": {
+      "signature": "cz3qxg5zYh1d8iENcz4p8tc8PwyngCygSfpTapyWieTGG5xqYgJ7v5R2VD7sGppefJj8zuvQG9uDsHfikvjoT6L",
+      "pairAddress": "GzMwBuW7YBXtdW6nTkhQSebnheU9sMkHBDj8RcsV1nwX",
+      "type": "sell",
+      "createdAt": "2025-11-11T14:59:55.995Z",
+      "liquiditySol": 30.000000005,
+      "liquidityToken": 1073000000,
+      "makerAddress": "F3oztRehB8B3GYFhvFHPQxKHE2tnSh1gj89XqmUvLnBU",
+      "priceSol": 2.8123208779684444e-08,
+      "priceUsd": 4.579020853508221e-06,
+      "tokenAmount": 6265396.825105,
+      "totalSol": 0.174000523,
+      "totalUsd": 28.330765154859996,
+      "innerIndex": null,
+      "outerIndex": 0
+    },
+    "chart": {
+      "bars": [
+        {
+          "time": 1762873125000,
+          "open": 5.469095097856641e-06,
+          "high": 5.788298998013063e-06,
+          "low": 5.469095097856641e-06,
+          "close": 5.788298998013063e-06,
+          "volume": 210.68617976394
+        },
+        {
+          "time": 1762873126000,
+          "open": 5.788298998013063e-06,
+          "high": 5.689915691709834e-06,
+          "low": 5.689915691709834e-06,
+          "close": 5.689915691709834e-06,
+          "volume": 100.26733655184
+        },
+        {
+          "time": 1762873127000,
+          "open": 5.689915691709834e-06,
+          "high": 5.464311717800643e-06,
+          "low": 5.251798404193406e-06,
+          "close": 5.251798404193406e-06,
+          "volume": 207.68358644742
+        },
+        {
+          "time": 1762873128000,
+          "open": 5.251798404193406e-06,
+          "high": 4.850084360814001e-06,
+          "low": 4.5536991661079745e-06,
+          "close": 4.5536991661079745e-06,
+          "volume": 313.63979172468004
+        },
+        {
+          "time": 1762873133000,
+          "open": 4.5536991661079745e-06,
+          "high": 4.993663389451646e-06,
+          "low": 4.6880706368017335e-06,
+          "close": 4.993663389451646e-06,
+          "volume": 322.06680016266
+        },
+        {
+          "time": 1762873134000,
+          "open": 4.993663389451646e-06,
+          "high": 5.19232873960139e-06,
+          "low": 4.744161900653512e-06,
+          "close": 4.744161900653512e-06,
+          "volume": 350.87560759344
+        },
+        {
+          "time": 1762873195000,
+          "open": 4.744161900653512e-06,
+          "high": 4.579020853508221e-06,
+          "low": 4.579020853508221e-06,
+          "close": 4.579020853508221e-06,
+          "volume": 28.330765154859996
+        }
+      ],
+      "noData": true,
+      "pairInfo": null,
+      "lastTransaction": null
+    },
+    "from_ms": 1704067200000,
+    "to_ms": 1762967024915,
+    "openTrading_ms": 1704067200000,
+    "lastTransactionTime_ms": 1762873195995,
+    "ath_price": 5.788298998013063e-06,
+    "supply": 1000000000.0,
+    "ath_market_cap": 5788.298998013063,
+    "timestamp": "2025-11-12T17:03:49.468518+00:00"
+  }
+]
