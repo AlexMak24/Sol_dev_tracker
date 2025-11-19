@@ -5,7 +5,7 @@ import time
 import base64
 import requests
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import asyncio
 import aiohttp
@@ -91,7 +91,6 @@ class TwitterAPI:
             return {"error": str(e)}
 
     async def process_twitter_url(self, twitter_url: str) -> dict:
-        # Проверяем, является ли URL постом - если да, возвращаем ошибку
         if self.is_post_url(twitter_url):
             return {"error": "Post URL - skipped", "is_post": True}
 
@@ -113,6 +112,7 @@ class AxiomTracker:
 
     TWITTER_REGEX = re.compile(r'https?://(?:twitter\.com|x\.com)/[^\s]+', re.IGNORECASE)
     DEV_CACHE_DURATION = 300  # 5 минут
+    ATH_CACHE_DURATION = 600  # 10 минут для ATH
 
     def __init__(self, auth_file: str, twitter_api_key: str, avg_tokens_count: int = 10):
         self.auth_file = auth_file
@@ -128,6 +128,7 @@ class AxiomTracker:
         self.uri_cache = {}
         self.update_pulse_cache = {}
         self.dev_mcap_cache = {}
+        self.ath_cache = {}  # ← Кэш для ATH
         self.sol_price_cache = {"price": 150.0, "timestamp": 0}
 
         # Очередь и пулы
@@ -142,6 +143,9 @@ class AxiomTracker:
         # WebSocket
         self.ws = None
         self.running = False
+
+        # GUI счетчик
+        self.gui_counter = 0
 
         # HTTP сессия
         self.session = requests.Session()
@@ -265,13 +269,115 @@ class AxiomTracker:
                 return None
         return None
 
+    async def _get_pair_ath_mcap(self, pair_address: str, supply: float) -> dict:
+        """Получение ATH market cap для пары с кэшированием"""
+        cache_key = f"{pair_address}_{supply}"
+
+        # Проверяем кэш
+        if cache_key in self.ath_cache:
+            cache_entry = self.ath_cache[cache_key]
+            age = time.time() - cache_entry["timestamp"]
+            if age < self.ATH_CACHE_DURATION:
+                return {
+                    "ath_mcap": cache_entry["ath_mcap"],
+                    "cached": True,
+                    "cache_age": int(age)
+                }
+
+        if not self._check_token_exp(self.token):
+            if not self._refresh_access_token():
+                return {"error": "Auth failed"}
+
+        sol_price = self._get_sol_price_cached()
+
+        # Параметры для получения свечей (30 дней)
+        from_ms = int((datetime.now(timezone.utc).timestamp() - 30 * 24 * 3600) * 1000)
+        to_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        params = {
+            "pairAddress": pair_address,
+            "from": str(from_ms),
+            "to": str(to_ms),
+            "currency": "USD",
+            "interval": "15m",
+            "openTrading": str(from_ms),
+            "lastTransactionTime": str(to_ms),
+            "countBars": "300",
+            "showOutliers": "false",
+            "isNew": "false"
+        }
+
+        cookies_dict = {"auth-access-token": self.token, "auth-refresh-token": self.refresh_token}
+
+        try:
+            async with self.dev_session.get('https://api.axiom.trade/pair-chart',
+                                            params=params,
+                                            cookies=cookies_dict,
+                                            timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    return {"error": f"API error: {resp.status}"}
+
+                data = await resp.json(content_type=None)
+
+                # Извлекаем свечи
+                bars = []
+                if isinstance(data, list):
+                    bars = data
+                elif isinstance(data, dict):
+                    for k in ("bars", "data", "chart", "candles", "ohlc", "result"):
+                        v = data.get(k)
+                        if isinstance(v, list):
+                            bars = v
+                            break
+
+                if not bars:
+                    return {"error": "No bars found"}
+
+                # Находим ATH price
+                max_price = 0.0
+                for bar in bars:
+                    if isinstance(bar, (list, tuple)) and len(bar) >= 5:
+                        high = float(bar[2]) if bar[2] is not None else 0.0
+                        close = float(bar[4]) if bar[4] is not None else 0.0
+                        max_price = max(max_price, high, close)
+                    elif isinstance(bar, dict):
+                        high = float(bar.get("h") or bar.get("high") or 0.0)
+                        close = float(bar.get("c") or bar.get("close") or bar.get("price") or 0.0)
+                        max_price = max(max_price, high, close)
+
+                if max_price == 0:
+                    return {"error": "No valid price data"}
+
+                ath_mcap = max_price * supply
+
+                # Кэшируем
+                self.ath_cache[cache_key] = {
+                    "ath_mcap": ath_mcap,
+                    "timestamp": time.time()
+                }
+
+                return {
+                    "ath_mcap": ath_mcap,
+                    "ath_price": max_price,
+                    "cached": False
+                }
+
+        except Exception as e:
+            return {"error": str(e)}
+
     async def _get_dev_avg_mcap(self, dev_address: str) -> dict:
-        """Получение avg market cap дева с кэшированием"""
+        """Получение avg market cap дева + ATH market cap с кэшированием"""
         if dev_address in self.dev_mcap_cache:
             cache_entry = self.dev_mcap_cache[dev_address]
             age = time.time() - cache_entry["timestamp"]
             if age < self.DEV_CACHE_DURATION:
-                return {"avg_mcap": cache_entry["avg_mcap"], "cached": True, "cache_age": int(age)}
+                return {
+                    "avg_mcap": cache_entry["avg_mcap"],
+                    "avg_ath_mcap": cache_entry.get("avg_ath_mcap", 0),
+                    "cached": True,
+                    "cache_age": int(age),
+                    "tokens_info": cache_entry.get("tokens_info", [])
+                }
 
         if not self._check_token_exp(self.token):
             if not self._refresh_access_token():
@@ -296,8 +402,10 @@ class AxiomTracker:
                          :self.avg_tokens_count]
 
                 valid_mcaps = []
+                tokens_info = []
                 MAX_REASONABLE_MCAP = 100_000_000_000
 
+                # Сначала собираем current mcap
                 for token in tokens:
                     price_sol = token.get('priceSol', 0)
                     supply = token.get('supply', 0)
@@ -318,6 +426,14 @@ class AxiomTracker:
 
                     valid_mcaps.append(mcap)
 
+                    tokens_info.append({
+                        "pair_address": token.get('pairAddress', 'N/A'),
+                        "ticker": token.get('tokenTicker', 'N/A'),
+                        "mcap": mcap,
+                        "supply": supply,
+                        "ath_mcap": 0
+                    })
+
                 if not valid_mcaps:
                     return {"error": "No valid tokens"}
 
@@ -326,13 +442,47 @@ class AxiomTracker:
                 if avg_mcap > MAX_REASONABLE_MCAP:
                     return {"error": "Invalid data"}
 
+                # ← ПОЛУЧАЕМ ATH ДЛЯ КАЖДОГО ТОКЕНА
+                ath_tasks = []
+                for token_info in tokens_info:
+                    if token_info["pair_address"] != 'N/A':
+                        ath_tasks.append(
+                            self._get_pair_ath_mcap(token_info["pair_address"], token_info["supply"])
+                        )
+                    else:
+                        ath_tasks.append(asyncio.sleep(0))
+
+                # Параллельно получаем все ATH
+                ath_results = await asyncio.gather(*ath_tasks, return_exceptions=True)
+
+                # Заполняем ATH
+                valid_ath_mcaps = []
+                for i, ath_result in enumerate(ath_results):
+                    if isinstance(ath_result, dict) and "ath_mcap" in ath_result:
+                        tokens_info[i]["ath_mcap"] = ath_result["ath_mcap"]
+                        valid_ath_mcaps.append(ath_result["ath_mcap"])
+                    elif isinstance(ath_result, Exception):
+                        tokens_info[i]["ath_mcap"] = 0
+
+                # AVG ATH Market Cap
+                avg_ath_mcap = sum(valid_ath_mcaps) / len(valid_ath_mcaps) if valid_ath_mcaps else 0
+
+                # Кэшируем
                 self.dev_mcap_cache[dev_address] = {
                     "avg_mcap": avg_mcap,
+                    "avg_ath_mcap": avg_ath_mcap,
                     "timestamp": time.time(),
-                    "valid_tokens": len(valid_mcaps)
+                    "valid_tokens": len(valid_mcaps),
+                    "tokens_info": tokens_info
                 }
 
-                return {"avg_mcap": avg_mcap, "cached": False, "valid_tokens": len(valid_mcaps)}
+                return {
+                    "avg_mcap": avg_mcap,
+                    "avg_ath_mcap": avg_ath_mcap,
+                    "cached": False,
+                    "valid_tokens": len(valid_mcaps),
+                    "tokens_info": tokens_info
+                }
 
         except Exception as e:
             return {"error": str(e)}
@@ -475,7 +625,7 @@ class AxiomTracker:
                 'twitter.com' in data['twitter'] or 'x.com' in data['twitter'])
         is_post = TwitterAPI.is_post_url(data['twitter']) if has_twitter else False
 
-        # === КОНСОЛЬНЫЙ ВЫВОД (оставляем как есть) ===
+        # === КОНСОЛЬНЫЙ ВЫВОД (FULL) ===
         print("\n" + "=" * 80)
         if has_twitter and not is_post:
             print("ТОКЕН НАЙДЕН С TWITTER!")
@@ -489,6 +639,7 @@ class AxiomTracker:
         print(f"Token Name:       {data['token_name']}")
         print(f"Token Ticker:     {data['token_ticker']}")
         print(f"Deployer:         {data['deployer_address']}")
+        print(f"Protocol:         {data['protocol']}")
 
         if is_post:
             print(f"Twitter:          Post URL (skipped) - {data['twitter']}")
@@ -497,6 +648,7 @@ class AxiomTracker:
         else:
             print(f"Twitter:          Not found")
 
+        # ← ВЫВОД DEV STATS + ATH (КОНСОЛЬ С ДЕТАЛЬНОЙ ИНФО)
         if dev_mcap_info:
             if 'error' in dev_mcap_info:
                 print(f"Dev Avg MC:       {dev_mcap_info['error']}")
@@ -505,8 +657,20 @@ class AxiomTracker:
                 valid_tokens_str = f" ({dev_mcap_info.get('valid_tokens', 0)} tokens)" if not dev_mcap_info.get(
                     'cached') else ""
                 print(f"Dev Avg MC:       ${dev_mcap_info['avg_mcap']:,.2f}{cached_str}{valid_tokens_str}")
+                print(f"Dev Avg ATH MC:   ${dev_mcap_info.get('avg_ath_mcap', 0):,.2f}")
+
+                # Выводим детальный список токенов с ATH (ТОЛЬКО В КОНСОЛЬ)
+                if 'tokens_info' in dev_mcap_info and dev_mcap_info['tokens_info']:
+                    print("-" * 80)
+                    print(f"DEV TOKENS (last {len(dev_mcap_info['tokens_info'])}):")
+                    for i, token_info in enumerate(dev_mcap_info['tokens_info'], 1):
+                        ath_str = f"${token_info.get('ath_mcap', 0):,.2f}" if token_info.get('ath_mcap',
+                                                                                             0) > 0 else "N/A"
+                        print(f"  {i}. [{token_info['ticker']}] {token_info['pair_address']}")
+                        print(f"     Current MC: ${token_info['mcap']:,.2f} | ATH MC: {ath_str}")
         else:
             print(f"Dev Avg MC:       Loading...")
+            print(f"Dev Avg ATH MC:   Loading...")
 
         if migrated is not None and non_migrated is not None and percentage is not None:
             print(f"Migrated Tokens:  {migrated}")
@@ -539,34 +703,44 @@ class AxiomTracker:
         print(f"Processing:     {processing_time:.3f}s ({processing_time * 1000:.2f}ms)")
         print("=" * 80 + "\n")
 
-        # === ЭМИТ В GUI ===
-        from token_emitter import token_emitter  # ← Импортируем здесь, чтобы не было цикла
+        # === ЭМИТ В GUI (БЕЗ ДЕТАЛЬНОГО СПИСКА ТОКЕНОВ) ===
+        try:
+            from token_emitter import token_emitter
 
-        gui_data = {
-            'token_name': data['token_name'],
-            'token_ticker': data['token_ticker'],
-            'token_address': data['token_address'],
-            'deployer_address': data['deployer_address'],
-            'twitter': data['twitter'],
-            'pair_address': data['pair_address'],
-            'twitter_stats': twitter_stats or {},
-            'dev_mcap_info': dev_mcap_info or {},
-            'migrated': migrated or 0,
-            'total': (migrated or 0) + (non_migrated or 0),
-            'percentage': round(percentage, 2) if percentage is not None else 0.0,
-            'processing_time_ms': int(processing_time * 1000),
-            'counter': getattr(self, 'gui_counter', 0) + 1
-        }
+            # ← ДОБАВЛЯЕМ ВРЕМЯ И AVG ATH
+            gui_data = {
+                'token_name': data['token_name'],
+                'token_ticker': data['token_ticker'],
+                'token_address': data['token_address'],
+                'deployer_address': data['deployer_address'],
+                'twitter': data['twitter'],
+                'pair_address': data['pair_address'],
+                'twitter_stats': twitter_stats or {},
+                'dev_mcap_info': dev_mcap_info or {},
+                'migrated': migrated or 0,
+                'total': (migrated or 0) + (non_migrated or 0),
+                'percentage': round(percentage, 2) if percentage is not None else 0.0,
+                'processing_time_ms': int(processing_time * 1000),
+                'counter': self.gui_counter + 1,
+                # ← НОВЫЕ ПОЛЯ ДЛЯ GUI
+                'created_at': data.get('created_at', ''),  # Время создания токена
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # Время отправки в GUI
+                'avg_ath_mcap': dev_mcap_info.get('avg_ath_mcap',
+                                                  0) if dev_mcap_info and 'error' not in dev_mcap_info else 0,
+                # AVG ATH
+                'avg_tokens_count': self.avg_tokens_count , # Количество токенов для расчета (N)
+                'protocol': data.get('protocol', 'unknown')
+            }
 
-        # Защита от None и ошибок
-        gui_data = {k: v for k, v in gui_data.items() if v is not None}
-        if 'error' in gui_data.get('dev_mcap_info', {}):
-            gui_data['dev_mcap_info'] = {'avg_mcap': 0, 'cached': False}
+            gui_data = {k: v for k, v in gui_data.items() if v is not None}
+            if 'error' in gui_data.get('dev_mcap_info', {}):
+                gui_data['dev_mcap_info'] = {'avg_mcap': 0, 'avg_ath_mcap': 0, 'cached': False}
 
-        # Увеличиваем счётчик
-        self.gui_counter = gui_data['counter']
+            self.gui_counter = gui_data['counter']
+            token_emitter.new_token.emit(gui_data)
+        except ImportError:
+            pass
 
-        token_emitter.new_token.emit(gui_data)
     def _process_pending_tokens(self):
         """Фоновая проверка очереди токенов"""
         while self.running:
@@ -583,7 +757,6 @@ class AxiomTracker:
                 if twitter_stats_future:
                     try:
                         twitter_stats = twitter_stats_future.result(timeout=2.0)
-                        # Проверяем что twitter_stats не None перед вызовом .get()
                         if twitter_stats:
                             if twitter_stats.get("error") and not twitter_stats.get("is_post"):
                                 print(f"Twitter API error: {twitter_stats['error']}")
@@ -596,7 +769,7 @@ class AxiomTracker:
                 dev_mcap_info = None
                 if dev_mcap_future:
                     try:
-                        dev_mcap_info = dev_mcap_future.result(timeout=3.0)
+                        dev_mcap_info = dev_mcap_future.result(timeout=10.0)  # ← Увеличили для ATH
                     except:
                         pass
 
@@ -616,11 +789,12 @@ class AxiomTracker:
                 print(f"⚠️ Error in process_pending_tokens: {e}")
 
     def _process_new_pairs(self, content, created_at):
-        """Обработка new_pairs с dev avg market cap"""
+        """Обработка new_pairs с dev avg market cap + ATH"""
         start_time = time.time()
         try:
             token_address = content.get('token_address', '')
             pair_address = content.get('pair_address', '')
+            protocol = content.get('protocol', 'unknown')
             if not token_address:
                 return
 
@@ -633,7 +807,8 @@ class AxiomTracker:
                 'twitter': content.get('twitter', ''),
                 'token_uri': content.get('token_uri', ''),
                 'created_at': created_at,
-                '__start_time': start_time
+                '__start_time': start_time,
+                'protocol': protocol
             }
 
             twitter_direct = data['twitter']
@@ -646,12 +821,10 @@ class AxiomTracker:
             if data['token_uri'] and data['token_uri'].strip():
                 uri_future = self.executor.submit(self._fetch_twitter_from_uri, data['token_uri'])
 
-            # Проверяем, не является ли прямой Twitter URL постом
             if twitter_direct and twitter_direct.strip() and twitter_direct != 'null' and (
                     'twitter.com' in twitter_direct or 'x.com' in twitter_direct):
                 if not TwitterAPI.is_post_url(twitter_direct):
                     twitter_stats = self._run_async_task(self.twitter_api.process_twitter_url(twitter_direct))
-                    # Проверяем что twitter_stats не None
                     if twitter_stats:
                         if twitter_stats.get("error") and not twitter_stats.get("is_post"):
                             print(f"Twitter API error: {twitter_stats['error']}")
@@ -667,7 +840,6 @@ class AxiomTracker:
                             twitter = twitter_from_uri
                             source = 'token_uri'
                             twitter_stats = self._run_async_task(self.twitter_api.process_twitter_url(twitter_from_uri))
-                            # Проверяем что twitter_stats не None
                             if twitter_stats:
                                 if twitter_stats.get("error") and not twitter_stats.get("is_post"):
                                     print(f"Twitter API error: {twitter_stats['error']}")
@@ -682,7 +854,7 @@ class AxiomTracker:
 
             data['twitter'] = twitter if twitter and twitter.strip() and twitter != 'null' else ''
 
-            # Запускаем проверку dev avg market cap асинхронно
+            # Запускаем проверку dev avg market cap + ATH асинхронно
             dev_mcap_future = asyncio.run_coroutine_threadsafe(
                 self._get_dev_avg_mcap(data['deployer_address']),
                 self.event_loop
@@ -700,9 +872,9 @@ class AxiomTracker:
                 non_migrated = total - migrated if total >= migrated else 0
                 percentage = (migrated / total * 100) if total > 0 else 0
 
-                # Ждем dev mcap
+                # Ждем dev mcap + ATH
                 try:
-                    dev_mcap_info = dev_mcap_future.result(timeout=3.0)
+                    dev_mcap_info = dev_mcap_future.result(timeout=10.0)  # ← Увеличили для ATH
                 except:
                     dev_mcap_info = {"error": "Timeout"}
 
@@ -718,7 +890,7 @@ class AxiomTracker:
                         (token_address, data, source, start_time, twitter_stats_future, dev_mcap_future)))
                 else:
                     try:
-                        dev_mcap_info = dev_mcap_future.result(timeout=3.0)
+                        dev_mcap_info = dev_mcap_future.result(timeout=10.0)
                     except:
                         dev_mcap_info = {"error": "Timeout"}
                     self._output_token_info(data, processing_time, source, twitter_stats, cache_time=cache_time,
@@ -829,8 +1001,10 @@ class AxiomTracker:
         print("⚡ Мониторинг всех токенов с миграциями")
         print("⚡ Twitter статистика (с фильтрацией постов)")
         print(f"⚡ Dev Avg Market Cap (последние {self.avg_tokens_count} токенов)")
+        print(f"⚡ Dev Avg ATH Market Cap (последние {self.avg_tokens_count} токенов)")
+        print("⚡ Dev Tokens: Pair Address + Ticker + Current MC + ATH MC")
         print("⚡ 50 параллельных потоков")
-        print("⚡ Кэширование (5 мин для dev stats)")
+        print("⚡ Кэширование (5 мин для dev stats, 10 мин для ATH)")
         print("=" * 80)
 
         self.running = True
@@ -869,9 +1043,8 @@ if __name__ == "__main__":
     tracker = AxiomTracker(
         auth_file=AUTH_FILE,
         twitter_api_key=TWITTER_API_KEY,
-        avg_tokens_count=10  # Количество токенов для расчета avg market cap
+        avg_tokens_count=10  # Количество токенов для расчета avg market cap + ATH
     )
-
 
     try:
         tracker.start()
