@@ -1,4 +1,4 @@
-# axiom_tracker.py — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (29.11.2025)
+# axiom_tracker.py — РАБОЧАЯ ВЕРСИЯ (29.11.2025) — БЕЗ ОШИБОК
 import ujson as json
 import websocket
 import ssl
@@ -198,7 +198,8 @@ class AxiomTracker:
                 return {"ath_mcap": entry["ath_mcap"], "cached": True}
 
         if not self._check_token_exp(self.token):
-            self._refresh_access_token()
+            if not self._refresh_access_token():
+                return {"error": "Auth failed"}
 
         from_ms = int((datetime.now(timezone.utc).timestamp() - 30*24*3600)*1000)
         to_ms = int(datetime.now(timezone.utc).timestamp()*1000)
@@ -245,8 +246,9 @@ class AxiomTracker:
             if time.time() - entry["timestamp"] < self.DEV_CACHE_DURATION:
                 return entry["result"]
 
-        if        if not self._check_token_exp(self.token):
-            self._refresh_access_token()
+        if not self._check_token_exp(self.token):
+            if not self._refresh_access_token():
+                return {"error": "Auth failed"}
 
         sol_price = self._get_sol_price_cached()
         params = {'devAddress': dev_address}
@@ -257,7 +259,7 @@ class AxiomTracker:
                 if resp.status != 200:
                     return {"error": "dev api error"}
                 data = await resp.json(content_type=None)
-                if 'tokens' not in data:
+                if 'tokens' not in data or not data['tokens']:
                     return {"error": "no tokens"}
 
                 tokens = sorted(data['tokens'], key=lambda x: x.get('createdAt', ''), reverse=True)[:self.avg_tokens_count]
@@ -286,8 +288,14 @@ class AxiomTracker:
 
                 avg_mcap = sum(valid_mcaps) / len(valid_mcaps)
 
-                # ATH для каждого
-                ath_tasks = [self._get_pair_ath_mcap(ti["pair_address"], ti["supply"]) if ti["pair_address"] != 'N/A' else asyncio.sleep(0) for ti in tokens_info]
+                # ATH
+                ath_tasks = []
+                for ti in tokens_info:
+                    if ti["pair_address"] != 'N/A':
+                        ath_tasks.append(self._get_pair_ath_mcap(ti["pair_address"], ti["supply"]))
+                    else:
+                        ath_tasks.append(asyncio.sleep(0))
+
                 ath_results = await asyncio.gather(*ath_tasks, return_exceptions=True)
 
                 valid_ath = []
@@ -321,9 +329,7 @@ class AxiomTracker:
             if r.status_code != 200 or 'application/json' not in r.headers.get('Content-Type', ''):
                 self.uri_cache[uri] = ''
                 return ''
-            data = r.json()
-            # простое извлечение twitter
-            text = json.dumps(data)
+            text = r.text
             match = re.search(r'(https?://(x\.com|twitter\.com)/[A-Za-z0-9_]+)', text)
             if match:
                 url = match.group(1)
@@ -336,10 +342,38 @@ class AxiomTracker:
 
     def _output_token_info(self, data, processing_time, source, twitter_stats=None,
                            migrated=None, non_migrated=None, percentage=None, cache_time=0, dev_mcap_info=None):
-        # Этот метод будет переопределён в server.py
-        # Здесь просто заглушка
         has_twitter = bool(data.get('twitter') and ('twitter.com' in data['twitter'] or 'x.com' in data['twitter']))
-        print(f"Токен: {data['token_ticker']} | Twitter: {'Да' if has_twitter else 'Нет'} | Dev MC: {dev_mcap_info.get('avg_mcap', 0):,.0f}$")
+        print("\n" + "="*80)
+        print("ТОКЕН НАЙДЕН С TWITTER!" if has_twitter else "НОВЫЙ ТОКЕН")
+        print(f"Тикер: {data['token_ticker']} | Twitter: {'Да' if has_twitter else 'Нет'} | Dev MC: {dev_mcap_info.get('avg_mcap', 0):,.0f}$ | ATH: {dev_mcap_info.get('avg_ath_mcap', 0):,.0f}$")
+        print(f"Время: {processing_time:.3f}s")
+        print("="*80 + "\n")
+
+        try:
+            from token_emitter import token_emitter
+            gui_data = {
+                'token_name': data['token_name'],
+                'token_ticker': data['token_ticker'],
+                'token_address': data['token_address'],
+                'deployer_address': data['deployer_address'],
+                'twitter': data.get('twitter', ''),
+                'pair_address': data['pair_address'],
+                'twitter_stats': twitter_stats or {},
+                'dev_mcap_info': dev_mcap_info or {},
+                'migrated': migrated or 0,
+                'total': (migrated or 0) + (non_migrated or 0),
+                'percentage': round(percentage, 2) if percentage is not None else 0,
+                'processing_time_ms': int(processing_time * 1000),
+                'counter': self.gui_counter + 1,
+                'created_at': data.get('created_at', ''),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'avg_ath_mcap': dev_mcap_info.get('avg_ath_mcap', 0) if dev_mcap_info else 0,
+                'protocol': data.get('protocol', 'unknown')
+            }
+            self.gui_counter += 1
+            token_emitter.new_token.emit(gui_data)
+        except ImportError:
+            pass
 
     def _process_new_pairs(self, content, created_at):
         start_time = time.time()
@@ -363,33 +397,29 @@ class AxiomTracker:
 
             # Twitter из URI
             if not data['twitter'] and data['token_uri']:
-                uri_twitter = self._fetch_twitter_from_uri(data['token_uri'])
-                if uri_twitter:
-                    data['twitter'] = uri_twitter
+                data['twitter'] = self._fetch_twitter_from_uri(data['token_uri'])
 
-            # Dev stats — СИНХРОННО (без ошибок event loop)
+            # Dev MC + ATH — СИНХРОННО, БЕЗ ОШИБОК
             try:
                 dev_info = asyncio.run_coroutine_threadsafe(
                     self._get_dev_avg_mcap(data['deployer_address']),
                     self.event_loop
                 ).result(timeout=12)
-            except:
-                dev_info = {"error": "timeout"}
+            except Exception as e:
+                dev_info = {"error": f"timeout: {e}"}
 
             # Миграции
             pulse = self.update_pulse_cache.get(token_address) or self.update_pulse_cache.get(pair_address)
+            migrated = non_migrated = percentage = None
             if pulse and len(pulse) > 41:
                 migrated = pulse[33] or 0
                 total = pulse[41] or 0
                 percentage = (migrated / total * 100) if total > 0 else 0
                 non_migrated = total - migrated
-            else:
-                migrated = non_migrated = percentage = None
 
-            processing_time = time.time() - start_time
             self._output_token_info(
                 data=data,
-                processing_time=processing_time,
+                processing_time=time.time() - start_time,
                 source='new_pairs',
                 dev_mcap_info=dev_info,
                 migrated=migrated,
@@ -397,7 +427,7 @@ class AxiomTracker:
                 percentage=percentage
             )
         except Exception as e:
-            print(f"Ошибка обработки: {e}")
+            print(f"Ошибка обработки токена: {e}")
 
     def _on_message(self, ws, message):
         try:
@@ -409,26 +439,26 @@ class AxiomTracker:
                 content = data.get("content", [])
                 now = time.time()
                 for item in content:
-                    if len(item) <= 30 or not item[30]:
-                        continue
+                    if len(item) <= 30 or not item[30]: continue
                     token_addr = item[0]
                     pair_addr = item[1]
-                    ts = datetime.fromisoformat(item[30].replace('Z', '+00:00')).timestamp()
-                    if now - ts <= 15:
-                        self.update_pulse_cache[token_addr] = item
-                        self.update_pulse_cache[pair_addr] = item
-                # чистка старого
-                keys_to_del = [k for k, v in self.update_pulse_cache.items() if now - datetime.fromisoformat(v[30].replace('Z', '+00:00')).timestamp() > 15]
-                for k in keys_to_del:
+                    try:
+                        ts = datetime.fromisoformat(item[30].replace('Z', '+00:00')).timestamp()
+                        if now - ts <= 15:
+                            self.update_pulse_cache[token_addr] = item
+                            self.update_pulse_cache[pair_addr] = item
+                    except: pass
+                # чистим старое
+                to_del = [k for k, v in self.update_pulse_cache.items() if now - datetime.fromisoformat(v[30].replace('Z', '+00:00')).timestamp() > 15]
+                for k in to_del:
                     del self.update_pulse_cache[k]
         except Exception as e:
             print(f"on_message error: {e}")
 
     def _on_open(self, ws):
-        print("WebSocket подключён")
+        print("WebSocket подключён — мониторинг запущен")
         ws.send(json.dumps({"action": "join", "room": "new_pairs"}))
         ws.send(json.dumps({"action": "join", "room": "update_pulse_v2"}))
-        print("Мониторинг запущен")
 
     def _on_error(self, ws, error):
         if "401" in str(error):
@@ -458,7 +488,7 @@ class AxiomTracker:
         if self.running:
             return
         self.running = True
-        print("Запуск трекера...")
+        print("Запуск Axiom трекера...")
         Thread(target=self._setup_async_loop, daemon=True).start()
         time.sleep(3)
         self._connect_websocket()
